@@ -1,28 +1,14 @@
 
 import os
-import time
-from threading import Lock
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+import re
+from urllib.parse import urlparse
 
+import requests
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
 API_TOKEN = os.environ.get("MUSIC_API_TOKEN", "")
-SOUNDCLOUD_ACCESS_TOKEN = os.environ.get(
-    "SOUNDCLOUD_ACCESS_TOKEN", ""
-)
-
-state = {
-    "status": "stopped",
-    "track": None,
-    "title": None,
-    "updated_at": time.time(),
-}
-
-state_lock = Lock()
 
 
 def authorized():
@@ -33,12 +19,32 @@ def authorized():
     )
 
 
+def validate_url(url):
+    if not isinstance(url, str) or len(url) > 500:
+        return False
+
+    parsed = urlparse(url)
+
+    if parsed.scheme != "https":
+        return False
+
+    if parsed.hostname not in {
+        "soundcloud.com",
+        "www.soundcloud.com",
+    }:
+        return False
+
+    if not re.fullmatch(r"/[\w-]+(?:/[\w-]+)*", parsed.path):
+        return False
+
+    return True
+
+
 @app.get("/")
 def home():
     return jsonify({
-        "name": "Roblox Music Player API",
+        "name": "Roblox Music Server",
         "status": "online",
-        "features": ["health", "search", "state", "command"],
     })
 
 
@@ -47,129 +53,81 @@ def health():
     return jsonify({"status": "online"})
 
 
-@app.get("/search")
-def search_soundcloud():
-    if not authorized():
-        return jsonify({"error": "Unauthorized"}), 401
-
-    query = request.args.get("q", "").strip()
-
-    if not query:
-        return jsonify({"error": "Geef een titel op via ?q=..."}), 400
-
-    if len(query) > 150:
-        return jsonify({"error": "Zoekterm is te lang"}), 400
-
-    if not SOUNDCLOUD_ACCESS_TOKEN:
-        return jsonify({
-            "error": "SOUNDCLOUD_ACCESS_TOKEN is niet ingesteld"
-        }), 503
-
-    params = urlencode({
-        "q": query,
-        "limit": 10,
-    })
-
-    req = Request(
-        f"https://api.soundcloud.com/tracks?{params}",
-        headers={
-            "Authorization": f"OAuth {SOUNDCLOUD_ACCESS_TOKEN}",
-            "Accept": "application/json",
-        },
-        method="GET",
-    )
-
-    try:
-        with urlopen(req, timeout=12) as response:
-            import json
-            payload = json.loads(response.read().decode("utf-8"))
-
-    except HTTPError as exc:
-        if exc.code == 401:
-            message = "SoundCloud-token ongeldig of verlopen"
-        elif exc.code == 429:
-            message = "SoundCloud heeft te veel verzoeken ontvangen"
-        else:
-            message = f"SoundCloud API-fout: {exc.code}"
-
-        return jsonify({"error": message}), 502
-
-    except (URLError, TimeoutError, ValueError, OSError):
-        return jsonify({
-            "error": "SoundCloud kon niet worden bereikt"
-        }), 502
-
-    results = []
-
-    for track in payload.get("collection", []):
-        artist = track.get("user") or {}
-
-        results.append({
-            "title": track.get("title"),
-            "artist": artist.get("username"),
-            "url": track.get("permalink_url"),
-            "soundcloud_id": track.get("id"),
-            "duration_ms": track.get("duration"),
-        })
-
-    return jsonify({
-        "query": query,
-        "count": len(results),
-        "results": results,
-    })
-
-
-@app.get("/state")
-def get_state():
-    if not authorized():
-        return jsonify({"error": "Unauthorized"}), 401
-
-    with state_lock:
-        return jsonify(state.copy())
-
-
-@app.post("/command")
-def command():
+@app.post("/track")
+def track():
     if not authorized():
         return jsonify({"error": "Unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
-    action = str(data.get("action", "")).lower()
+    url = data.get("url")
 
-    with state_lock:
-        if action == "play":
-            # Alleen een bestaande, echte Roblox-audio-ID accepteren.
-            audio_id = str(data.get("audio_id", "")).strip()
+    if not validate_url(url):
+        return jsonify({
+            "error": "Ongeldige SoundCloud-URL"
+        }), 400
 
-            if not audio_id.isdigit():
-                return jsonify({
-                    "error": "Geef een geldige Roblox-audioasset-ID op"
-                }), 400
+    try:
+        response = requests.get(
+            url,
+            timeout=10,
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            },
+            allow_redirects=False,
+        )
 
-            state["track"] = audio_id
-            state["title"] = str(data.get("title", ""))[:150]
-            state["status"] = "playing"
+        if response.status_code != 200:
+            return jsonify({
+                "error": "SoundCloud-pagina is niet beschikbaar",
+                "status_code": response.status_code,
+            }), 502
 
-        elif action == "pause":
-            if state["track"] is None:
-                return jsonify({"error": "Geen track geselecteerd"}), 409
-            state["status"] = "paused"
+        # Lees alleen metadata uit de openbare HTML-pagina.
+        from bs4 import BeautifulSoup
 
-        elif action == "resume":
-            if state["track"] is None:
-                return jsonify({"error": "Geen track geselecteerd"}), 409
-            state["status"] = "playing"
+        soup = BeautifulSoup(response.text, "html.parser")
 
-        elif action == "stop":
-            state["status"] = "stopped"
-            state["track"] = None
-            state["title"] = None
+        title = None
+        artist = None
 
-        else:
-            return jsonify({"error": "Onbekende actie"}), 400
+        og_title = soup.find(
+            "meta",
+            property="og:title",
+        )
 
-        state["updated_at"] = time.time()
-        return jsonify({"success": True, "state": state.copy()})
+        if og_title:
+            title = og_title.get("content")
+
+        og_url = soup.find(
+            "meta",
+            property="og:url",
+        )
+
+        canonical_url = (
+            og_url.get("content")
+            if og_url
+            else url
+        )
+
+        if title and " by " in title:
+            title, artist = title.rsplit(" by ", 1)
+
+        return jsonify({
+            "title": title,
+            "artist": artist,
+            "url": canonical_url,
+            "source": "SoundCloud",
+            "playable_in_roblox": False,
+            "message": (
+                "Trackinformatie opgehaald. "
+                "Een compatibele Roblox-audiobron is nodig om af te spelen."
+            ),
+        })
+
+    except requests.RequestException:
+        return jsonify({
+            "error": "SoundCloud kon niet worden bereikt"
+        }), 502
 
 
 if __name__ == "__main__":
