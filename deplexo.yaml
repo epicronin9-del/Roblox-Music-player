@@ -3,7 +3,7 @@ version: 1
 type: web
 
 build:
-  framework: auto
+  framework: dockerfile
   root_dir: .
   install: pip install -r requirements.txt
 
