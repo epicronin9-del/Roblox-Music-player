@@ -1,0 +1,12 @@
+
+version: 1
+type: web
+
+build:
+  framework: auto
+  root_dir: .
+  install: pip install -r requirements.txt
+
+run:
+  command: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1
+  port: 3000
