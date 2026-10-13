@@ -1,29 +1,22 @@
 
 import os
 import hmac
+
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, HttpUrl
 
-app = FastAPI(title="Deplexo Roblox Music API")
+app = FastAPI(title="Deplexo Audio API")
 
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY", "")
 
 
 class TrackRequest(BaseModel):
     url: HttpUrl
 
 
-def verify_api_key(x_api_key: str | None):
-    if not API_KEY or not x_api_key:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not hmac.compare_digest(x_api_key, API_KEY):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
 @app.get("/")
 def home():
-    return {"status": "online", "service": "Deplexo Music API"}
+    return {"status": "online", "service": "Deplexo Audio API"}
 
 
 @app.get("/health")
@@ -32,29 +25,33 @@ def health():
 
 
 @app.post("/track")
-def track_info(
+def get_track(
     request: TrackRequest,
-    x_api_key: str | None = Header(default=None),
+    x_api_key: str = Header(default="", alias="x-api-key"),
 ):
-    verify_api_key(x_api_key)
-
-    url = str(request.url)
-    host = (request.url.host or "").lower()
-
-    if host not in ("soundcloud.com", "www.soundcloud.com"):
+    # Controleer de API-key die je bij Deplexo als environment variable instelt.
+    if not API_KEY:
         raise HTTPException(
-            status_code=400,
-            detail="Gebruik een geldige SoundCloud-link."
+            status_code=500,
+            detail="API_KEY is niet ingesteld op de server",
         )
 
+    if not hmac.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Ongeldige API-key",
+        )
+
+    url = str(request.url)
+
+    # Dit endpoint geeft alleen metadata/status terug.
+    # Een SoundCloud-link is niet automatisch afspeelbaar in Roblox.
     return {
-        "status": "success",
-        "source": "SoundCloud",
+        "status": "received",
         "url": url,
-        "title": None,
         "playable_in_roblox": False,
         "message": (
-            "API-authenticatie geslaagd. "
-            "Metadata en Roblox-compatibele audio moeten nog worden aangesloten."
+            "Link ontvangen. Gebruik voor afspelen een "
+            "audioasset die door Roblox wordt ondersteund."
         ),
     }
