@@ -1,13 +1,12 @@
+
 import os
 import hmac
-
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, HttpUrl
 
-app = FastAPI(title="Roblox Music API")
+app = FastAPI(title="Deplexo Roblox Music API")
 
-# Stel API_KEY in bij de omgevingsvariabelen van je hostingdienst.
-EXPECTED_API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY")
 
 
 class TrackRequest(BaseModel):
@@ -15,17 +14,16 @@ class TrackRequest(BaseModel):
 
 
 def verify_api_key(x_api_key: str | None):
-    if not EXPECTED_API_KEY or not x_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-        )
+    if not API_KEY or not x_api_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if not hmac.compare_digest(x_api_key, EXPECTED_API_KEY):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-        )
+    if not hmac.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+@app.get("/")
+def home():
+    return {"status": "online", "service": "Deplexo Music API"}
 
 
 @app.get("/health")
@@ -41,20 +39,22 @@ def track_info(
     verify_api_key(x_api_key)
 
     url = str(request.url)
-    host = request.url.host.lower()
+    host = (request.url.host or "").lower()
 
     if host not in ("soundcloud.com", "www.soundcloud.com"):
         raise HTTPException(
             status_code=400,
-            detail="Alleen SoundCloud-links zijn toegestaan.",
+            detail="Gebruik een geldige SoundCloud-link."
         )
 
-    # Deze route valideert de link, maar haalt nog geen
-    # SoundCloud-metadata op en levert geen audioasset.
     return {
-        "message": "API-authenticatie geslaagd. Metadata-provider moet nog worden aangesloten.",
+        "status": "success",
         "source": "SoundCloud",
-        "playable_in_roblox": False,
         "url": url,
         "title": None,
+        "playable_in_roblox": False,
+        "message": (
+            "API-authenticatie geslaagd. "
+            "Metadata en Roblox-compatibele audio moeten nog worden aangesloten."
+        ),
     }
