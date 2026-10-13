@@ -14,7 +14,7 @@ app = FastAPI(
     version="2.0.0",
 )
 
-API_KEY = os.getenv("API_KEY", "").strip()
+API_KEY = os.getenv("MUSIC_API_KEY", "").strip()
 
 
 class TrackRequest(BaseModel):
