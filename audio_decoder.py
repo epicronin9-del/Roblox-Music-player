@@ -1,33 +1,40 @@
+
 from dataclasses import dataclass
 from collections.abc import Iterator
 import subprocess
 
 
-@dataclass
+@dataclass(frozen=True)
 class AudioFormat:
     sample_rate: int = 24000
     channels: int = 2
-    sample_width: int = 2  # 16-bit PCM
+    sample_width: int = 2
 
 
 def decode_audio(source: str) -> Iterator[bytes]:
-    """Decode een toegankelijke audiobron naar PCM-blokken."""
+    """
+    Decodeer een toegankelijke audiobron naar PCM-blokken.
+    Gebruik dit niet rechtstreeks met ongecontroleerde gebruikers-URL's.
+    """
     fmt = AudioFormat()
 
+    command = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", source,
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "-ar", str(fmt.sample_rate),
+        "-ac", str(fmt.channels),
+        "pipe:1",
+    ]
+
     process = subprocess.Popen(
-        [
-            "ffmpeg",
-            "-nostdin",
-            "-v", "error",
-            "-i", source,
-            "-f", "s16le",
-            "-acodec", "pcm_s16le",
-            "-ar", str(fmt.sample_rate),
-            "-ac", str(fmt.channels),
-            "pipe:1",
-        ],
+        command,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
 
     assert process.stdout is not None
@@ -38,6 +45,15 @@ def decode_audio(source: str) -> Iterator[bytes]:
             if not chunk:
                 break
             yield chunk
+
+        exit_code = process.wait(timeout=10)
+        if exit_code != 0:
+            raise RuntimeError(
+                f"FFmpeg stopte met foutcode {exit_code}"
+            )
     finally:
-        process.kill()
-        process.wait()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+        process.stdout.close()
