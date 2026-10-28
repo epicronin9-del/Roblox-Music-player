@@ -1,3 +1,4 @@
+
 import os
 import hmac
 import logging
@@ -11,10 +12,17 @@ logger = logging.getLogger("deplexo")
 
 app = FastAPI(
     title="Deplexo Audio API",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 API_KEY = os.getenv("MUSIC_API_KEY", "").strip()
+
+ALLOWED_HOSTS = {
+    "soundcloud.com",
+    "www.soundcloud.com",
+    "m.soundcloud.com",
+    "on.soundcloud.com",
+}
 
 
 class TrackRequest(BaseModel):
@@ -26,7 +34,7 @@ def home():
     return {
         "status": "online",
         "service": "Deplexo Audio API",
-        "version": "2.0.0",
+        "version": "2.1.0",
     }
 
 
@@ -43,15 +51,13 @@ def track(
     request: TrackRequest,
     x_api_key: str = Header(default="", alias="x-api-key"),
 ):
-    # Controleer of de serverconfiguratie compleet is.
     if not API_KEY:
-        logger.error("API_KEY ontbreekt in de serverconfiguratie.")
+        logger.error("MUSIC_API_KEY ontbreekt.")
         raise HTTPException(
             status_code=503,
-            detail="Serverconfiguratie ontbreekt: stel API_KEY in.",
+            detail="Serverconfiguratie ontbreekt.",
         )
 
-    # Controleer de sleutel zonder deze te loggen.
     if not hmac.compare_digest(x_api_key.strip(), API_KEY):
         raise HTTPException(
             status_code=401,
@@ -68,28 +74,25 @@ def track(
             detail="Gebruik een HTTPS-link.",
         )
 
-    if host not in {
-        "soundcloud.com",
-        "www.soundcloud.com",
-        "m.soundcloud.com",
-        "on.soundcloud.com",
-    }:
+    if host not in ALLOWED_HOSTS:
         raise HTTPException(
             status_code=400,
-            detail="Deze API accepteert momenteel alleen SoundCloud-links.",
+            detail="Alleen SoundCloud-links zijn toegestaan.",
         )
 
-    logger.info("Track-URL ontvangen; de URL wordt niet als audio afgespeeld.")
+    # De decoder wordt bewust niet met de pagina-URL aangeroepen:
+    # een SoundCloud-pagina is niet hetzelfde als een audiostream.
+    logger.info("SoundCloud-link ontvangen; geen audio afgespeeld.")
 
     return {
         "status": "received",
         "url": url,
         "source": "SoundCloud",
+        "decoder_available": False,
         "playable_in_roblox": False,
-        "title": None,
         "audio_asset_id": None,
         "message": (
-            "Link ontvangen. Voor Roblox-weergave is een "
-            "Roblox-compatibele audio-asset nodig."
+            "Link ontvangen. De audiobron en Roblox-audio-uitvoer "
+            "zijn nog niet gekoppeld."
         ),
     }
