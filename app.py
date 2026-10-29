@@ -5,6 +5,8 @@ import shutil
 import logging
 import subprocess
 import tempfile
+import threading
+
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,7 +17,7 @@ from fastapi import (
     UploadFile,
     File,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from starlette.background import BackgroundTask
 
@@ -24,13 +26,10 @@ logger = logging.getLogger("deplexo")
 
 app = FastAPI(
     title="Deplexo Audio API",
-    version="3.0.0",
+    version="3.1.0",
 )
 
-# Configureer deze variabele in de hostingomgeving.
-# Dit is de sleutel voor Roblox -> Deplexo.
 API_KEY = os.getenv("MUSIC_API_KEY", "").strip()
-
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
 ALLOWED_HOSTS = {
@@ -40,11 +39,13 @@ ALLOWED_HOSTS = {
     "on.soundcloud.com",
 }
 
-# Limieten voor fase 1.
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_AUDIO_SECONDS = 300
+
 PCM_SAMPLE_RATE = 24000
 PCM_CHANNELS = 2
+PCM_SAMPLE_WIDTH = 2
+PCM_CHUNK_SIZE = 19200
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "deplexo_audio"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -90,13 +91,77 @@ def ffmpeg_available() -> bool:
         return False
 
 
+async def save_upload(audio_file: UploadFile) -> tuple[Path, int]:
+    input_path = None
+    total_bytes = 0
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="input_",
+            suffix=".audio",
+            dir=TEMP_DIR,
+            delete=False,
+        ) as temp_input:
+            input_path = Path(temp_input.name)
+
+            while True:
+                chunk = await audio_file.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                total_bytes += len(chunk)
+
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Bestand is groter dan 50 MB.",
+                    )
+
+                temp_input.write(chunk)
+
+        if total_bytes == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Het geüploade bestand is leeg.",
+            )
+
+        return input_path, total_bytes
+
+    except Exception:
+        if input_path:
+            cleanup_file(input_path)
+        raise
+
+    finally:
+        await audio_file.close()
+
+
+def ffmpeg_command(input_path: Path) -> list[str]:
+    return [
+        FFMPEG_PATH,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(input_path),
+        "-map", "0:a:0",
+        "-vn",
+        "-t", str(MAX_AUDIO_SECONDS),
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "-ar", str(PCM_SAMPLE_RATE),
+        "-ac", str(PCM_CHANNELS),
+        "pipe:1",
+    ]
+
+
 @app.get("/")
 def home():
     return {
         "status": "online",
         "service": "Deplexo Audio API",
         "version": app.version,
-        "phase": "1",
+        "phase": "PCM streaming",
     }
 
 
@@ -110,6 +175,7 @@ def health():
         "output_format": "signed 16-bit little-endian PCM",
         "sample_rate": PCM_SAMPLE_RATE,
         "channels": PCM_CHANNELS,
+        "chunk_size_bytes": PCM_CHUNK_SIZE,
         "roblox_playback_connected": False,
     }
 
@@ -137,23 +203,19 @@ def track(
             detail="Alleen SoundCloud-links zijn toegestaan.",
         )
 
-    # Belangrijk: een pagina-URL is geen audiostream.
-    # SoundCloud-resolutie wordt in een volgende stap toegevoegd.
-    decoder_ready = ffmpeg_available()
-
     logger.info("SoundCloud-URL gevalideerd.")
 
     return {
         "status": "received",
         "url": url,
         "source": "SoundCloud",
-        "decoder_available": decoder_ready,
+        "decoder_available": ffmpeg_available(),
         "source_resolver_available": False,
         "playable_in_roblox": False,
         "audio_asset_id": None,
         "message": (
-            "URL gevalideerd. De SoundCloud-bronresolver en "
-            "Roblox-audio-uitvoer zijn nog niet gekoppeld."
+            "URL gevalideerd. Een SoundCloud-bronresolver "
+            "is nog niet aangesloten."
         ),
     }
 
@@ -163,56 +225,19 @@ async def decode(
     audio_file: UploadFile = File(...),
     x_api_key: str = Header(default="", alias="x-api-key"),
 ):
-    """
-    Upload een audiobestand dat je mag gebruiken.
-    De server converteert het naar ruwe PCM en retourneert
-    de PCM-data als download.
-
-    Formaat: s16le, 24000 Hz, stereo.
-    """
-
     require_api_key(x_api_key)
 
     if not ffmpeg_available():
         raise HTTPException(
             status_code=503,
-            detail="FFmpeg is niet geïnstalleerd of niet beschikbaar.",
+            detail="FFmpeg is niet beschikbaar.",
         )
 
     input_path = None
     output_path = None
 
     try:
-        with tempfile.NamedTemporaryFile(
-            prefix="input_",
-            suffix=".audio",
-            dir=TEMP_DIR,
-            delete=False,
-        ) as temp_input:
-            input_path = Path(temp_input.name)
-            total_bytes = 0
-
-            while True:
-                chunk = await audio_file.read(1024 * 1024)
-
-                if not chunk:
-                    break
-
-                total_bytes += len(chunk)
-
-                if total_bytes > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Bestand is groter dan 50 MB.",
-                    )
-
-                temp_input.write(chunk)
-
-        if total_bytes == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Het geüploade bestand is leeg.",
-            )
+        input_path, _ = await save_upload(audio_file)
 
         fd, output_name = tempfile.mkstemp(
             prefix="pcm_",
@@ -222,65 +247,30 @@ async def decode(
         os.close(fd)
         output_path = Path(output_name)
 
-        command = [
-            FFMPEG_PATH,
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-i", str(input_path),
-            "-map", "0:a:0",
-            "-vn",
-            "-t", str(MAX_AUDIO_SECONDS),
-            "-f", "s16le",
-            "-acodec", "pcm_s16le",
-            "-ar", str(PCM_SAMPLE_RATE),
-            "-ac", str(PCM_CHANNELS),
-            "-y",
-            str(output_path),
+        command = ffmpeg_command(input_path)[:-1] + [
+            str(output_path)
         ]
 
-        logger.info("Audio-upload ontvangen; decoder wordt gestart.")
-
-        try:
-            result = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=90,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(
-                status_code=408,
-                detail="Audio-decoding duurde te lang.",
-            )
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=90,
+            check=False,
+        )
 
         if result.returncode != 0 or not output_path.exists():
-            error_text = result.stderr.decode(
-                "utf-8", errors="replace"
-            )[:1000]
-
-            logger.warning("FFmpeg kon het bestand niet decoderen.")
-
             raise HTTPException(
                 status_code=422,
-                detail={
-                    "message": "Audio kon niet worden gedecodeerd.",
-                    "decoder_error": error_text,
-                },
+                detail="Audio kon niet worden gedecodeerd.",
             )
 
         if output_path.stat().st_size == 0:
             raise HTTPException(
                 status_code=422,
-                detail="Het bestand bevat geen decodeerbare audiotrack.",
+                detail="Geen decodeerbare audiotrack gevonden.",
             )
-
-        logger.info(
-            "PCM-decoding geslaagd: %s bytes.",
-            output_path.stat().st_size,
-        )
 
         return FileResponse(
             path=output_path,
@@ -301,12 +291,18 @@ async def decode(
             cleanup_file(output_path)
         raise
 
-    except Exception:
-        logger.exception("Onverwachte fout tijdens audio-decoding.")
-
+    except subprocess.TimeoutExpired:
         if output_path:
             cleanup_file(output_path)
+        raise HTTPException(
+            status_code=408,
+            detail="Audio-decoding duurde te lang.",
+        )
 
+    except Exception:
+        logger.exception("Fout tijdens audio-decoding.")
+        if output_path:
+            cleanup_file(output_path)
         raise HTTPException(
             status_code=500,
             detail="Interne fout tijdens audio-decoding.",
@@ -316,7 +312,105 @@ async def decode(
         if input_path:
             cleanup_file(input_path)
 
-        await audio_file.close()
+
+@app.post("/decode/stream")
+async def decode_stream(
+    audio_file: UploadFile = File(...),
+    x_api_key: str = Header(default="", alias="x-api-key"),
+):
+    """
+    Ontvang een audiobestand en stream de PCM-uitvoer
+    rechtstreeks vanuit FFmpeg in blokken.
+    """
+
+    require_api_key(x_api_key)
+
+    if not ffmpeg_available():
+        raise HTTPException(
+            status_code=503,
+            detail="FFmpeg is niet beschikbaar.",
+        )
+
+    input_path = None
+
+    try:
+        input_path, total_bytes = await save_upload(audio_file)
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("Upload kon niet worden opgeslagen.")
+        raise HTTPException(
+            status_code=500,
+            detail="Upload kon niet worden opgeslagen.",
+        )
+
+    logger.info(
+        "PCM-stream gestart. Upload: %s bytes.",
+        total_bytes,
+    )
+
+    def generate():
+        process = None
+
+        try:
+            process = subprocess.Popen(
+                ffmpeg_command(input_path),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+
+            if process.stdout is None:
+                raise RuntimeError("FFmpeg stdout ontbreekt.")
+
+            while True:
+                chunk = process.stdout.read(PCM_CHUNK_SIZE)
+
+                if not chunk:
+                    break
+
+                yield chunk
+
+            exit_code = process.wait(timeout=90)
+
+            if exit_code != 0:
+                logger.error(
+                    "FFmpeg eindigde met code %s.",
+                    exit_code,
+                )
+
+        except Exception:
+            logger.exception("PCM-stream is mislukt.")
+
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+                if process.stdout:
+                    process.stdout.close()
+
+            cleanup_file(input_path)
+            logger.info("PCM-stream beëindigd.")
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/octet-stream",
+        headers={
+            "X-Audio-Format": "s16le",
+            "X-Audio-Sample-Rate": str(PCM_SAMPLE_RATE),
+            "X-Audio-Channels": str(PCM_CHANNELS),
+            "X-Audio-Sample-Width": str(PCM_SAMPLE_WIDTH),
+            "X-Audio-Chunk-Size": str(PCM_CHUNK_SIZE),
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+        background=BackgroundTask(cleanup_file, input_path),
+    )
 
 
 @app.get("/decoder-info")
@@ -334,12 +428,10 @@ def decoder_info(
         "output": "s16le PCM",
         "sample_rate": PCM_SAMPLE_RATE,
         "channels": PCM_CHANNELS,
+        "sample_width": PCM_SAMPLE_WIDTH,
+        "chunk_size": PCM_CHUNK_SIZE,
         "max_duration_seconds": MAX_AUDIO_SECONDS,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
-        "note": (
-            "PCM-decoding is beschikbaar als FFmpeg werkt. "
-            "Roblox-afspeeluitvoer is nog niet aangesloten."
-        ),
     }
 
 
@@ -353,7 +445,4 @@ def startup():
     if ffmpeg_available():
         logger.info("FFmpeg-decoder beschikbaar.")
     else:
-        logger.warning(
-            "FFmpeg niet gevonden. Stel FFmpeg_PATH in of "
-            "installeer FFmpeg in de hostingomgeving."
-        )
+        logger.warning("FFmpeg niet gevonden.")
