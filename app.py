@@ -446,3 +446,5 @@ def startup():
         logger.info("FFmpeg-decoder beschikbaar.")
     else:
         logger.warning("FFmpeg niet gevonden.")
+        
+import base64
