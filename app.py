@@ -448,3 +448,23 @@ def startup():
         logger.warning("FFmpeg niet gevonden.")
         
 import base64
+
+@app.get("/pcm/test")
+async def pcm_test():
+    sample_rate = 24000
+    channels = 2
+    duration = 0.2
+
+    # 0,2 seconde stilte: 24.000 Hz, stereo, 16-bit
+    byte_count = int(sample_rate * channels * 2 * duration)
+    pcm_data = bytes(byte_count)
+
+    return {
+        "success": True,
+        "codec": "pcm_s16le",
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "bits_per_sample": 16,
+        "duration": duration,
+        "data": base64.b64encode(pcm_data).decode("ascii")
+    }
